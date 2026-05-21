@@ -1,21 +1,31 @@
-"""VRM Visualizer & blend shape generator.
+"""VRM Visualizer + blend-shape + idle animation system.
 
-Generates VRM blend shape weights (lip-sync + expression + body motion)
-from AudioQuery phoneme data. Saves as JSON frames for viz/index.html viewer.
+- Lip sync from phonemes
+- Emotion expressions (controlled per-expression-slot)
+- Idle animation: random blinks + body sway when no speech
+- Generates vrma_frames.json for HTML viewer
 """
 import json
 import logging
+import math
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
-from src.config import VRM_MODEL_PATH, paths
+from src.config import (VRM_MODEL_PATH,
+                        EXPRESSION_INTERVAL,
+                        IDLE_BLINK_INTERVAL,
+                        IDLE_BLINK_DURATION,
+                        IDLE_BODY_SWAY_MIN, IDLE_BODY_SWAY_MAX,
+                        IDLE_BLINK_SWAY_INTERVAL,
+                        IDLE_RANDOM_BLINK_MIN, IDLE_RANDOM_BLINK_MAX,
+                        paths)
 
 log = logging.getLogger("vox-radio.vrm")
 
-# ── Lip sync phoneme → VRM blend shape name mappings ──
+# ── phoneme → VRM blend-shape name ─────────
 LIP_MAP = {
     "a":   "a",  "i":   "i",  "u":   "u",  "e":  "e", "o":  "o",
     "A":   "a",  "I":   "i",  "U":   "u",  "E":  "e", "O":  "o",
@@ -25,106 +35,142 @@ LIP_MAP = {
     "r":   "e",  "l":   "e",
     "w":   "u",  "y":   "i",
     "q":   "i",
-    "N":   "a",  # n (nasal)
+    "N":   "a",
 }
 
-# ── Emotion → (preset, base_weight) ──
 EMOTION_MAP = {
-    "happy":   ("happy",  0.8),
-    "joy":     ("joy",    0.6),
+    "happy":   ("happy",   0.8),
+    "joy":     ("joy",     0.6),
     "surprised": ("surprised", 0.7),
-    "sad":     ("sad",    0.6),
-    "angry":   ("angry",  0.5),
-    "funny":   ("funny",  0.4),
-    "neutral": ("a", 0.0),
+    "sad":     ("sad",     0.6),
+    "angry":   ("angry",   0.5),
+    "funny":   ("funny",   0.4),
+    "neutral": ("neutral", 1.0),
 }
 
 
+# ── frame data ──────────────────────────────
 @dataclass
 class BlendShapeFrame:
-    """One frame of VRM blend shape weights."""
+    """One frame of VRM blend-shape weights."""
     timestamp: float
-    lips: dict[str, float] = field(default_factory=dict)
-    expressions: dict[str, float] = field(default_factory=dict)
-    body: dict[str, float] = field(default_factory=dict)
+    lips:      dict = field(default_factory=lambda: {"a":0,"i":0,"u":0,"e":0,"o":0})
+    expr:      dict = field(default_factory=lambda: {"neutral":1.0})
+    body:      dict = field(default_factory=dict)
+    idle:      str = "none"        # none | blink | sway | breathe
 
     def to_dict(self) -> dict:
-        return {
-            "t": self.timestamp,
-            "lips": self.lips,
-            "expressions": self.expressions,
-            "body": self.body,
-        }
+        return {"t": self.timestamp, "lips": self.lips, "expr": self.expr,
+                "body": self.body, "idle": self.idle}
 
-    def save_frame(self) -> str:
-        """Append frame to viz/vrma_frames.json and return path."""
+    def save(self):
+        """Append to viz/vrma_frames.json."""
         viz_dir = Path(paths()["base"]) / "viz"
         viz_dir.mkdir(parents=True, exist_ok=True)
-        viz_frames = viz_dir / "vrma_frames.json"
-
-        all_frames = [self.to_dict()]
-        if viz_frames.exists():
-            with open(viz_frames) as f:
-                existing = json.load(f)
-            all_frames = existing + all_frames
-
-        with open(viz_frames, "w") as f:
-            json.dump(all_frames, f, ensure_ascii=False, indent=2)
-
-        return str(viz_frames)
+        path = viz_dir / "vrma_frames.json"
+        frames = [self.to_dict()]
+        if path.exists():
+            with open(path) as f:
+                frames = json.load(f) + frames
+        with open(path, "w") as f:
+            json.dump(frames, f, ensure_ascii=False, indent=2)
 
 
+# ── VRM visualizer ──────────────────────────
 class VRMVisualizer:
-    """Generate VRM blend shapes from AudioQuery phoneme data."""
+    """Lip-sync · expression · idle animation."""
 
-    def __init__(self, vrm_model_path: str = VRM_MODEL_PATH):
-        self.vrm_model_path = vrm_model_path
+    def __init__(self, model_path: str = VRM_MODEL_PATH):
+        self.model_path = model_path
+        self._expr_timer = time.time()
+        self._expr_name  = "neutral"
 
-    def generate_from_phoneme(self, phoneme: str, intensity: float = 1.0) -> BlendShapeFrame:
-        """Generate blend shape frame from a single phoneme."""
+        # idle timers
+        self._blink_timer  = time.time()
+        self._sway_timer   = time.time()
+        self._sway_angles  = {"x": 0.0, "y": 0.0}
+
+    # ── lip sync ──
+    def phoneme_frame(self, phoneme: str, intensity: float = 1.0) -> BlendShapeFrame:
         frame = BlendShapeFrame(timestamp=time.time())
-        frame.lips = {"a": 0.0, "i": 0.0, "u": 0.0, "e": 0.0, "o": 0.0}
-        if phoneme.lower() in LIP_MAP:
-            frame.lips[LIP_MAP[phoneme.lower()]] = min(intensity, 1.0)
+        frame.lips = {c: 0.0 for c in "aiueo"}
+        lo = phoneme.lower()
+        if lo in LIP_MAP:
+            frame.lips[LIP_MAP[lo]] = min(intensity, 1.0)
+        frame.expr = {"neutral": 1.0}
         return frame
 
-    def generate_from_audio_query(self, audio_query: dict) -> list[BlendShapeFrame]:
-        """Generate blend shape frames from VOICEVOX AudioQuery."""
-        frames = []
-        for phrase in audio_query.get("accent_phrases", []):
-            for mora in phrase.get("moras", []):
-                frame = BlendShapeFrame(timestamp=time.time())
-                consonant = mora.get("consonant")
-                if consonant:
-                    frame.lips = {"a": 0.0, "i": 0.0, "u": 0.0, "e": 0.0, "o": 0.0}
-                    frame.lips[LIP_MAP.get(consonant, "a")] = 0.8
-                else:
-                    frame.lips["a"] = 0.7  # vowel only
-                frame.expressions["neutral"] = 0.0
-                frames.append(frame)
-        return frames
+    def lip_sync_from_phonemes(self, phonemes: list[str]) -> list[BlendShapeFrame]:
+        return [self.phoneme_frame(p) for p in phonemes]
 
-    def set_expression(self, emotion: str = "neutral", weight: float = 1.0) -> BlendShapeFrame:
-        """Set expression blend shape for an emotion."""
-        if emotion in EMOTION_MAP:
-            preset, base_w = EMOTION_MAP[emotion]
-            frame = BlendShapeFrame(timestamp=time.time())
-            frame.expressions[preset] = base_w * weight
-            frame.expressions["neutral"] = 1.0 - weight
-            return frame
-        return BlendShapeFrame(timestamp=time.time())
+    def lip_sync_from_text(self, text: str) -> list[BlendShapeFrame]:
+        """Naive → split text into phoneme-like chunks."""
+        phs = []
+        for ch in text.replace(" ", ""):
+            if ch in "aiueoAIUEO":
+                phs.append(ch)
+        if not phs:
+            phs = ["a"]
+        return self.lip_sync_from_phonemes(phs)
 
-    def set_body_motion(
-        self,
-        breath_scale: float = 0.02,
-        head_tilt: float = 0.0,
-        body_rotate: float = 0.0,
-    ) -> BlendShapeFrame:
-        """Set body motion parameters."""
+    # ── expression (controlled per slot) ──
+    def apply_expression(self, emotion: str, weight: float = 1.0) -> BlendShapeFrame:
         frame = BlendShapeFrame(timestamp=time.time())
-        frame.body = {
-            "chest_breath": breath_scale,
-            "head_tilt": head_tilt,
-            "body_rotation": body_rotate,
-        }
+        frame.expr = {"neutral": 0.0}
+        preset, base_w = EMOTION_MAP.get(emotion, ("neutral", 1.0))
+        frame.expr[preset] = min(base_w * weight, 1.0)
+        self._expr_name = emotion
+        return frame
+
+    def auto_expression(self, emotion: str, weight: float) -> BlendShapeFrame | None:
+        """Return frame only if expression slot has expired."""
+        now = time.time()
+        if now - self._expr_timer < EXPRESSION_INTERVAL:
+            return None
+        self._expr_timer = now
+        self._expr_name = emotion
+        return self.apply_expression(emotion, weight)
+
+    @property
+    def current_expression(self) -> str:
+        return self._expr_name
+
+    # ── body motion ──
+    def body_frame(self, chest: float = 0.02, tilt: float = 0.0) -> BlendShapeFrame:
+        frame = BlendShapeFrame(timestamp=time.time())
+        frame.body = {"chest_breath": chest, "head_tilt": tilt}
+        return frame
+
+    # ── idle animation ────────────────────────────────────────
+    def idle_frame(self) -> BlendShapeFrame:
+        """Generate one idle frame with random blink + sway."""
+        now = time.time()
+        frame = BlendShapeFrame(timestamp=now)
+        frame.lips = {c: 0.0 for c in "aiueo"}
+        frame.expr = {"neutral": 1.0}
+        frame.body = {"chest_breath": 0.02, "head_tilt": 0.0}
+
+        # blink
+        if now - self._blink_timer > random.uniform(IDLE_RANDOM_BLINK_MIN, IDLE_RANDOM_BLINK_MAX):
+            self._blink_timer = now
+            frame.idle = "blink"
+            frame.expr["blink"] = 1.0
+            log.debug("idle: blink")
+            return frame
+
+        # body sway (re-randomize at fixed interval)
+        if now - self._sway_timer > IDLE_BLINK_SWAY_INTERVAL:
+            self._sway_timer = now
+            sx = random.uniform(IDLE_BODY_SWAY_MIN, IDLE_BODY_SWAY_MAX)
+            sy = random.uniform(IDLE_BODY_SWAY_MIN, IDLE_BODY_SWAY_MAX)
+            self._sway_angles = {"x": sx, "y": sy}
+            frame.body.update({"head_tilt": sx, "body_rotation": sy})
+            frame.idle = "sway"
+            log.debug("idle: sway x=%.3f y=%.3f", sx, sy)
+            return frame
+
+        # gentle breathing
+        breath = 0.02 + 0.01 * math.sin(now * 0.8)
+        frame.body["chest_breath"] = breath
+
         return frame

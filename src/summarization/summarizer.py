@@ -1,12 +1,7 @@
-"""Summarizer using Ollama (Gemma4 e4b) with sentiment analysis.
+"""Summarizer using Ollama (Gemma4 e4b) with sentiment + context-aware prompts.
 
-Generates:
-- Short summary (~700 chars)
-- Sentiment (positive/neutral/negative) with score
-- Emotion breakdown (joy/sadness/surprise/fear/anger/trust/anticipation)
-- Keywords
-
-Saves to output/summaries/ as JSON.
+Context mode: appends the last N transcripts as context so summaries flow naturally.
+Emotion tracking: returns emotion scores per-batch.
 """
 import json
 import logging
@@ -23,8 +18,11 @@ except ImportError:
 
 from src.config import (
     OLLAMA_MODEL,
+    OLLAMA_URL,
     SUMMARY_MAX_TOKENS,
     EMOTION_ANALYSIS,
+    USE_CONTEXT,
+    CONTEXT_ROLLBACK_DEPTH,
     paths,
 )
 
@@ -54,6 +52,7 @@ class SummaryResult:
     sentiment: dict = field(default_factory=lambda: {"label": "neutral", "score": 0.5})
     emotions: Optional[EmotionScores] = None
     keywords: list[str] = field(default_factory=list)
+    context_used: bool = False
     raw_response: str = ""
 
     def to_json(self) -> dict:
@@ -68,23 +67,21 @@ class SummaryResult:
             "sentiment": self.sentiment,
             "emotions": emotions_dict,
             "keywords": self.keywords,
+            "context_used": self.context_used,
         }
 
 
 class Summarizer:
-    """Generate summaries with Ollama / Gemma4."""
-
     PROMPT = """あなたは、日本のFMラジオ放送を要約するアシスタントです。
 以下の文字起こしテキストを受けて、以下のJSON形式で出力してください。
-
 出力は必ずJSON形式のみとしてください。
 
-{
+{{
   "summary": "500文字以内の要約",
-  "sentiment": {"label": "positive/neutral/negative", "score": 0.0-1.0},
-  "emotions": {"joy": 0.0-1.0, "sadness": 0.0-1.0, "surprise": 0.0-1.0, "fear": 0.0-1.0, "anger": 0.0-1.0, "trust": 0.0-1.0, "anticipation": 0.0-1.0},
+  "sentiment": {{"label": "positive/neutral/negative", "score": 0.0-1.0}},
+  "emotions": {{"joy": 0.0-1.0, "sadness": 0.0-1.0, "surprise": 0.0-1.0, "fear": 0.0-1.0, "anger": 0.0-1.0, "trust": 0.0-1.0, "anticipation": 0.0-1.0}},
   "keywords": ["キーワード1", "キーワード2", "キーワード3"]
-}
+}}
 
 文字起こしテキスト:
 """
@@ -92,13 +89,18 @@ class Summarizer:
     def __init__(self, model: str = OLLAMA_MODEL):
         self.model = model
 
-    def summarize(
-        self,
-        text: str,
-        max_tokens: int = SUMMARY_MAX_TOKENS,
-    ) -> SummaryResult:
-        """Summarize transcription text and analyze sentiment/emotions."""
-        log.info("Summarizing with %s (max=%d)...", self.model, max_tokens)
+    def summarize(self, text: str, context: str = "") -> SummaryResult:
+        """Summarize and analyze emotion. Context is appended if USE_CONTEXT=True."""
+        log.info("Summarizing with %s (max=%d)...", self.model, SUMMARY_MAX_TOKENS)
+
+        prompt = self.PROMPT + text[:4000]
+        if USE_CONTEXT and context:
+            prompt = (
+                "直前の放送からの文字起こし（継続した内容として要約してください）:\n"
+                f"{context}\n\n"
+                "現在の放送:\n" + text[:4000]
+            )
+            prompt += "\n\n直前の内容も踏まえて要約してください。"
 
         if ollama is None:
             log.warning("ollama not installed, using fallback")
@@ -107,16 +109,12 @@ class Summarizer:
         resp = ollama.chat(
             model=self.model,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant that summarizes Japanese FM radio broadcast transcripts and analyzes sentiment. Output ONLY valid JSON — no markdown, no explanation, no code fences.",
-                },
-                {"role": "user", "content": f"{self.PROMPT}\n{text[:4000]}"},
+                {"role": "system",
+                 "content": "You summarize Japanese FM radio transcripts as continuous content. "
+                            "Output ONLY valid JSON — no markdown, no code fences."},
+                {"role": "user", "content": prompt},
             ],
-            options={
-                "num_predict": max_tokens,
-                "temperature": 0.3,
-            },
+            options={"num_predict": SUMMARY_MAX_TOKENS, "temperature": 0.3},
         )
 
         raw = resp["message"]["content"]
@@ -125,7 +123,6 @@ class Summarizer:
 
     def _parse_response(self, raw: str) -> SummaryResult:
         cleaned = raw
-        # Remove markdown code fences if present
         for marker in ["```json", "```"]:
             if marker in cleaned:
                 start = cleaned.index(marker) + len(marker)
@@ -140,43 +137,34 @@ class Summarizer:
         try:
             data = json.loads(cleaned)
         except (json.JSONDecodeError, ValueError):
-            log.warning("Failed to parse summary JSON, using fallback")
-            data = {
-                "summary": cleaned[:500],
-                "sentiment": {"label": "neutral", "score": 0.5},
-                "emotions": {},
-                "keywords": [],
-            }
+            log.warning("Failed to parse summary JSON, fallback")
+            data = {"summary": cleaned[:500], "sentiment": {"label": "neutral", "score": 0.5},
+                    "emotions": {}, "keywords": []}
 
         emotions_data = data.get("emotions", {})
         result = SummaryResult(
-            timestamp=time.time(),
-            model=self.model,
+            timestamp=time.time(), model=self.model,
             summary=data.get("summary", raw[:500]),
             sentiment=data.get("sentiment", {"label": "neutral", "score": 0.5}),
             emotions=EmotionScores(**emotions_data) if EMOTION_ANALYSIS and emotions_data else None,
             keywords=data.get("keywords", []),
             raw_response=raw,
         )
-
         self._save(result)
         return result
 
-    def _save(self, result: SummaryResult):
+    def _save(self, result):
         p = paths()
         summ_path = Path(p["summ_dir"]) / f"summ_{result.batch_id}.json"
         with open(summ_path, "w") as f:
             json.dump(result.to_json(), f, ensure_ascii=False, indent=2)
-        log.info("Summary saved: %s", summ_path)
+        log.info("Summary saved: %s (context_used=%s)", summ_path, result.context_used)
 
     def _fallback(self, text: str) -> SummaryResult:
-        """Fallback when Ollama is unavailable."""
         return SummaryResult(
-            timestamp=time.time(),
-            model=self.model,
-            summary=text[:500] + "... (Ollama未接続のためフォールバック)" if len(text) > 500 else text + "... (フォールバック)",
+            timestamp=time.time(), model=self.model,
+            summary=text[:500] + " (Ollama未接続)",
             sentiment={"label": "neutral", "score": 0.5},
             emotions=EmotionScores() if EMOTION_ANALYSIS else None,
-            keywords=[],
-            raw_response=text,
+            keywords=[], raw_response=text,
         )

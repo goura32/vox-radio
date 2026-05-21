@@ -1,11 +1,12 @@
-"""HeartFM WebSocket receiver (JCBA FMラダリオ API).
+"""Dual-stream HeartFM receiver with overlapping capture.
 
-Receives Ogg/Opus audio from JCBA/FMラダリオ's WebSocket stream.
-Handles:
-- JWT token acquisition (15s expiry — auto-refresh)
-- WebSocket connection with subprotocol
-- Ogg/Opus packet collection
-- Stream → WAV via ffmpeg pipe
+Maintains two WebSocket connections to JCBA FMラダリオ and alternates
+them every RECORD_DURATION seconds with STREAM_SWITCH_OVERLAP seconds
+of overlap to prevent audio gaps.
+
+Pipeline output:
+  - Queue[AudioSegment]: each item is (stream_index, overlap_flag, wav_path, meta)
+  - Saves raw/ogg, meta.json, raw→WAV conversion
 """
 import asyncio
 import json
@@ -14,217 +15,183 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
-from io import BytesIO
 from typing import Optional
 
 import requests
+
 import websockets
 
-from src.config import JCBA_API_URL, HEARTFM_STATION_ID, paths
+from src.config import (JCBA_API_URL, HEARTFM_STATION_ID, RECORD_DURATION,
+                        STREAM_SWITCH_OVERLAP, MAX_STREAMS, paths)
 
 log = logging.getLogger("vox-radio.receiver")
 
 
 @dataclass
-class StreamInfo:
-    url: str
-    token: str
-    expires_at: float  # epoch timestamp
+class AudioSegment:
+    """One contiguous audio segment captured from one stream."""
+    segment_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    stream_index: int = 0
+    capture_start: float = 0.0
+    duration_sec: float = 0.0
+    wav_path: str = ""
+    meta_path: str = ""
+    raw_ogg_path: str = ""
+    is_duplicate: bool = False
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass
-class AudioFrame:
-    frame_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    timestamp: Optional[float] = None
-    raw_data: bytes = b""
-    duration_sec: float = 0.0
+class _StreamState:
+    ws: Optional[object] = None
+    url: str = ""
+    token: str = ""
+    expires_at: float = 0.0
+    chunks: list[bytes] = field(default_factory=list)
+    alive: bool = False
+    _refresh_task: Optional[asyncio.Task] = None
 
 
-class Receiver:
-    """Manage WebSocket stream to HeartFM.
-    Auto-renews JWT tokens every 10 seconds.
-    Collects Ogg/Opus chunks.
-    """
+class DualStreamReceiver:
+    """Capture via two alternating WebSocket streams (overlap = no gaps)."""
 
     def __init__(self, station_id: str = HEARTFM_STATION_ID):
         self.station_id = station_id
-        self.ws = None
-        self.stream: Optional[StreamInfo] = None
-        self._chunks: list[bytes] = []
+        self._a = _StreamState(stream_index=0)
+        self._b = _StreamState(stream_index=1)
+        self._active: _StreamState = self._a
+        self._output_q: asyncio.Queue = asyncio.Queue()
         self._running = False
-        self._refresh_task: Optional[asyncio.Task] = None
+        self._task: Optional[asyncio.Task] = None
 
-    async def open(self) -> StreamInfo:
-        """Connect to HeartFM stream. Returns StreamInfo."""
-        log.info("Opening stream for station=%s", self.station_id)
+    # ── public API ────────────────────────────
 
-        # 1) Get streaming URL + token
-        resp = requests.post(
-            JCBA_API_URL,
-            params={
-                "station": self.station_id,
-                "channel": "0",
-                "quality": "high",
-                "burst": "5",
-            },
-            json={"station": self.station_id},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        self.stream = StreamInfo(
-            url=body["location"],
-            token=body["token"],
-            expires_at=time.time() + 15,
-        )
-
-        # 2) Open WebSocket
-        self.ws = await websockets.connect(
-            self.stream.url,
-            subprotocols=["listener.fmplapla.com"],
-            additional_headers={
-                "Authorization": f"Bearer {self.stream.token}",
-            },
-        )
-        await self.ws.send(self.stream.token)
-        log.info("WebSocket connected to %s", self.stream.url)
-
-        # 3) Start token-refresh background task
+    async def start(self):
         self._running = True
-        self._refresh_task = asyncio.create_task(self._refresh_loop())
-        return self.stream
+        self._task = asyncio.create_task(self._capture_loop())
+        log.info("DualStreamReceiver started  duration=%ds overlap=%ds streams=%d",
+                 RECORD_DURATION, STREAM_SWITCH_OVERLAP, MAX_STREAMS)
 
-    async def close(self):
-        """Stop and disconnect."""
+    async def stop(self):
         self._running = False
-        if self._refresh_task:
-            self._refresh_task.cancel()
+        if self._task:
+            self._task.cancel()
             try:
-                await self._refresh_task
+                await self._task
             except asyncio.CancelledError:
                 pass
-        if self.ws:
-            await self.ws.close()
-            self.ws = None
-        log.info("Stream closed")
+        for s in (self._active, self._b):
+            if s.ws:
+                await s.ws.close()
+                s.ws = None
+            s.alive = False
 
-    async def receive_frames(self, duration: float = 5.0) -> list[AudioFrame]:
-        """Receive audio for `duration` seconds. Returns list of AudioFrame."""
-        if not self.ws:
-            raise RuntimeError("Call open() first")
+    async def get_segment(self, timeout=None):
+        if timeout:
+            return await asyncio.wait_for(self._output_q.get(), timeout)
+        return await self._output_q.get()
 
-        frames: list[AudioFrame] = []
-        end = time.monotonic() + duration
-        current_chunk = b""
-        start = time.monotonic()
+    # ── capture loop ──────────────────────────
 
-        while time.monotonic() < end and self._running:
-            try:
-                data = await asyncio.wait_for(
-                    self.ws.recv(), timeout=min(0.5, end - time.monotonic())
-                )
-                if isinstance(data, bytes):
-                    current_chunk += data
+    async def _capture_loop(self):
+        self._a.url, self._a.token = await self._get_token()
+        self._a.ws = await self._open_ws(self._a.url, self._a.token)
+        self._a._refresh_task = asyncio.create_task(self._refresh_loop(self._a))
+        self._a.alive = True
 
-                # Flush every 100ms of audio (approx)
-                elapsed_mono = time.monotonic() - start
-                if current_chunk and len(current_chunk) > 0:
-                    frame = AudioFrame(
-                        timestamp=time.time(),
-                        raw_data=current_chunk,
-                        duration_sec=elapsed_mono,
-                    )
-                    frames.append(frame)
-                    self._chunks.append(current_chunk)
-                    current_chunk = b""
-                    start = time.monotonic()
+        self._b.url, self._b.token = await self._get_token()
+        self._b.ws = await self._open_ws(self._b.url, self._b.token)
+        self._b._refresh_task = asyncio.create_task(self._refresh_loop(self._b))
+        self._b.alive = True
 
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                log.error("Receive error: %s", e)
-                break
-
-        # Remaining buffered data
-        if current_chunk:
-            frames.append(AudioFrame(
-                timestamp=time.time(),
-                raw_data=current_chunk,
-            ))
-
-        return frames
-
-    def save_raw_to_wav(self, output_path: str) -> str:
-        """Save collected raw Ogg data to WAV via ffmpeg."""
-        raw_ogg = b"".join(self._chunks)
-        ogg_path = output_path.replace(".wav", ".ogg")
-        with open(ogg_path, "wb") as f:
-            f.write(raw_ogg)
-
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", ogg_path,
-                "-acodec", "pcm_s16le",
-                "-ar", "16000",
-                "-ac", "1",
-                output_path,
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            log.error("ffmpeg WAV conversion failed: %s", result.stderr)
-
-        meta_path = output_path.replace(".wav", "_meta.json")
-        with open(meta_path, "w") as f:
-            json.dump({
-                "station": self.station_id,
-                "duration_sec": sum(fr.duration_sec for fr in frames) if frames else 0,
-                "channels": 1,
-                "sample_rate": 48000,
-                "codec": "Opus",
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }, f, indent=2)
-
-        return output_path
-
-    async def _refresh_loop(self):
-        """Refresh JWT every 10s while stream is active."""
+        active = self._a
         while self._running:
-            await asyncio.sleep(10)
-            if not self._running:
-                break
-            await self._recreate_stream()
+            # 1. Collect audio for RECORD_DURATION+OVERLAP (new stream starts during overlap)
+            start = time.monotonic()
+            overlap = STREAM_SWITCH_OVERLAP
+            duration = RECORD_DURATION - overlap  # pure-new portion
+            await asyncio.sleep(duration)  # wait for new-capture duration
 
-    async def _recreate_stream(self):
-        """Get a new token and reconnect."""
-        resp = requests.post(
-            JCBA_API_URL,
-            params={
-                "station": self.station_id,
-                "channel": "0",
-                "quality": "high",
-                "burst": "5",
-            },
-            json={"station": self.station_id},
-            timeout=10,
-        )
+            # 2. Connect new stream as backup (start during overlap)
+            other = self._active
+            other_url, other_token = await self._get_token()
+            other.ws = await self._open_ws(other_url, other_token)
+            other._refresh_task = asyncio.create_task(self._refresh_loop(other))
+            other.alive = True
+
+            # 3. Finish overlap and dump old stream
+            elapsed = time.monotonic() - start
+            await asyncio.sleep(overlap - elapsed)
+
+            chunked_bytes = b"".join(active.chunks)
+            seg = await self._dump_segment(active)
+            active.alive = False
+            await active.ws.close()
+            active.ws = None
+            if active._refresh_task:
+                active._refresh_task.cancel()
+            active.chunks = []
+
+            self._output_q.put_nowait(seg)
+
+            # 4. Swap roles
+            self._active = other
+
+    async def _dump_segment(self, stream: _StreamState) -> AudioSegment:
+        raw_ogg_path = f"{paths()['raw']}/rec_{stream.stream_index}_{uuid.uuid4().hex[:8]}.ogg"
+        with open(raw_ogg_path, "wb") as f:
+            f.write(stream.chunks[-100000:] if len(stream.chunks) > 100000 else
+                    b"".join(stream.chunks[-1000:]) or b"".join(stream.chunks))
+
+        wav_path = raw_ogg_path.rsplit(".", 1)[0] + ".wav"
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", raw_ogg_path,
+             "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", wav_path],
+            capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            log.error("ffmpeg failed: %s", result.stderr)
+
+        meta = {"station": self.station_id, "stream_index": stream.stream_index,
+                "codec": "Opus", "sample_rate": 48000,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
+        meta_path = wav_path + "_meta.json"
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+        # detect overlap by timestamp diff
+        is_dup = False  # TODO: compare last N chars with previous segments
+        return AudioSegment(
+            stream_index=stream.stream_index, duration_sec=RECORD_DURATION,
+            wav_path=wav_path, raw_ogg_path=raw_ogg_path,
+            meta_path=meta_path, is_duplicate=is_dup, metadata=meta)
+
+    # ── helpers ─────────────────────────────────
+
+    async def _get_token(self):
+        resp = requests.post(JCBA_API_URL,
+                             params={"station": self.station_id, "channel": "0",
+                                     "quality": "high", "burst": "5"},
+                             json={"station": self.station_id}, timeout=10)
         resp.raise_for_status()
         body = resp.json()
+        return body["location"], body["token"]
 
-        self.stream = StreamInfo(
-            url=body["location"],
-            token=body["token"],
-            expires_at=time.time() + 15,
-        )
+    async def _open_ws(self, url, token):
+        ws = await websockets.connect(url,
+                                      subprotocols=["listener.fmplapla.com"],
+                                      additional_headers={"Authorization": f"Bearer {token}"})
+        await ws.send(token)
+        log.info("Stream WebSocket connected to %s", url)
+        return ws
 
-        if self.ws:
-            await self.ws.close()
-        self.ws = await websockets.connect(
-            self.stream.url,
-            subprotocols=["listener.fmplapla.com"],
-            additional_headers={"Authorization": f"Bearer {self.stream.token}"},
-        )
-        await self.ws.send(self.stream.token)
-        self._chunks.clear()
-        log.info("Token refreshed, new stream connected")
+    async def _refresh_loop(self, stream: _StreamState):
+        while stream.alive and self._running:
+            await asyncio.sleep(10)
+            try:
+                tok_url, tok_token = await self._get_token()
+                stream.token = tok_token
+                stream.expires_at = time.time() + 15
+                await stream.ws.send(tok_token)
+                log.info("Stream %d token refreshed", stream.stream_index)
+            except Exception as e:
+                log.warning("Stream %d refresh failed: %s", stream.stream_index, e)
