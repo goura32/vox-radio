@@ -1,0 +1,13 @@
+[project]
+name = "vox-radio"
+version = "0.1.0"
+description = "FM radio receive → transcribe → summarize → VOICEVOX → VRM avatar visualization pipeline"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "websockets",
+    "faster-whisper",
+    "ollama",
+    "torch",
+    "numpy",
+]

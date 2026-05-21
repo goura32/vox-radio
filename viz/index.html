@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VOX-Radio — VRM Avatar Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #eee; font-family: 'Segoe UI', 'Hiragino Sans', sans-serif; overflow: hidden; }
+  #canvas-container { width: 100vw; height: 80vh; position: relative; }
+  #controls { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.7); padding: 12px; border-radius: 8px; z-index: 10; min-width: 220px; }
+  #controls h3 { margin-bottom: 8px; color: #0ff; font-size: 14px; }
+  #controls label { display: block; font-size: 12px; margin: 4px 0 2px; }
+  #controls select, #controls input[type=range] { width: 100%; }
+  #controls button { background: #0ff; color: #1a1a2e; border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; margin-top: 6px; width: 100%; }
+  #controls button:hover { background: #0cc; }
+  #controls button.danger { background: #ff6b6b; }
+  #controls button.danger:hover { background: #ee5555; }
+  #status { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.8); padding: 8px 14px; z-index: 10; display: flex; gap: 20px; font-size: 12px; border-top: 1px solid #333; }
+  #status div { min-width: 200px; }
+  #status .label { color: #888; }
+  #status .value { color: #0ff; }
+  #summary-panel { position: absolute; bottom: 50px; left: 10px; background: rgba(0,0,0,0.85); padding: 14px; border-radius: 8px; z-index: 10; max-width: 400px; max-height: 35vh; overflow-y: auto; font-size: 13px; line-height: 1.6; border: 1px solid #0ff3; }
+  #summary-panel h4 { color: #0ff; margin-bottom: 6px; }
+  #summary-panel .emotion-bar { height: 6px; border-radius: 3px; margin: 2px 0; }
+  .loading { position: fixed; inset: 0; background: #1a1a2e; display: flex; align-items: center; justify-content: center; z-index: 100; font-size: 18px; color: #0ff; flex-direction: column; gap: 16px; }
+  .loading.hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="loading" id="loading">
+  <div>VOX-Radio VRM Viewer</div>
+  <div>読み込み中...</div>
+</div>
+
+<div id="canvas-container">
+  <div id="controls">
+    <h3>VRM Controls</h3>
+    <label>VRM Model:</label>
+    <select id="model-select">
+      <option value="hrn0Hk8kxp">hrn0Hk8kxp (デフォルト)</option>
+      <option value="kiyoshi">kiyoshi (男性)</option>
+      <option value="tsumugi">tsumugi (女性)</option>
+    </select>
+    <label>表情:</label>
+    <select id="expression-select">
+      <option value="neutral">ニュートラル</option>
+      <option value="happy">喜び</option>
+      <option value="joy">嬉しさ</option>
+      <option value="surprised">驚き</option>
+      <option value="sad">悲しみ</option>
+      <option value="angry">怒り</option>
+      <option value="funny">面白い</option>
+    </select>
+    <button onclick="applyExpression()">表情適用</button>
+    <button onclick="resetExpression()">表情リセット</button>
+    <label>リップ:</label>
+    <button onclick="triggerLip('a')">あ</button>
+    <button onclick="triggerLip('i')">い</button>
+    <button onclick="triggerLip('u')">う</button>
+    <button onclick="triggerLip('e')">え</button>
+    <button onclick="triggerLip('o')">お</button>
+    <label>身振り:</label>
+    <input type="range" id="breath-slider" min="0" max="0.1" step="0.01" value="0.02">
+    <button onclick="applyBodyMotion()">適用</button>
+    <button class="danger" id="pipeline-btn" onclick="togglePipeline()">パイプライン開始</button>
+  </div>
+  <div id="summary-panel" style="display:none;">
+    <h4>要約結果</h4>
+    <div id="summary-text"></div>
+    <div id="emotion-bars"></div>
+  </div>
+</div>
+
+<div id="status">
+  <div><span class="label">状況：</span><span class="value" id="status-text">待機中</span></div>
+  <div><span class="label">リップ：</span><span class="value" id="lip-status">-</span></div>
+  <div><span class="label">表情：</span><span class="value" id="expr-status">ニュートラル</span></div>
+  <div><span class="label">フレーム：</span><span class="value" id="frame-count">0</span></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.140.2/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.140.2/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.140.2/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three-vrm@1.0.9/lib/three-vrm.min.js"></script>
+
+<script>
+let scene, camera, renderer, controls, vrm;
+let lipSyncValues = { a: 0, i: 0, u: 0, e: 0, o: 0 };
+let frameCount = 0;
+let currentExpression = "neutral";
+let pipelinePaused = true;
+
+function setStatus(text) { document.getElementById('status-text').textContent = text; }
+
+async function initScene() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1a1a2e);
+  
+  camera = new THREE.PerspectiveCamera(30, window.innerWidth / (window.innerHeight * 0.8), 0.1, 100);
+  camera.position.set(0, 1.2, 3);
+  
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight * 0.8);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  document.getElementById('canvas-container').insertBefore(renderer.domElement, document.getElementById('controls'));
+  
+  const al = new THREE.AmbientLight(0xffffff, 0.6);
+  scene.add(al);
+  const dl = new THREE.DirectionalLight(0xffffff, 0.8);
+  dl.position.set(1, 2, 1);
+  scene.add(dl);
+  
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1.0, 0);
+  controls.update();
+  
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(10, 10),
+    new THREE.MeshStandardMaterial({ color: 0x0a0a1a })
+  );
+  ground.rotation.x = -Math.PI / 2;
+  scene.add(ground);
+  
+  return await loadVRM('hrn0Hk8kxp');
+}
+
+async function loadVRM(vid) {
+  const url = `assets/vrms/${vid}.glb`;
+  const loader = new THREE.GLTFLoader();
+  loader.load(url, async (gltf) => {
+    const model = gltf.scene;
+    model.position.set(0, -0.77, 0);
+    scene.add(model);
+    
+    await THREE.VRM.load(gltf, (vrm) => {
+      if (window.vrm) scene.remove(window.vrm.scene);
+      window.vrm = vrm;
+      vrm.humanoid.getNormalizedPose();
+      const skinMeshes = vrm.expressionManager?.getPreset('neutral');
+      console.log('VRM loaded', vrm);
+      animate();
+    });
+  });
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  if (window.vrm) {
+    THREE.VRM.utils.updateBones(window.vrm, 1/60);
+    // Update lip sync from blend shapes
+    updateLipSync();
+  }
+  renderer.render(scene, camera);
+}
+
+function updateLipSync() {
+  if (!window.vrm || !window.vrm.expressionManager) return;
+  // Simple lip sync: set 'A' preset based on current vowel
+  let maxPhoneme = 'a', maxVal = 0;
+  for (const [phn, val] of Object.entries(lipSyncValues)) {
+    if (val > maxVal) { maxVal = val, maxPhoneme = phn; }
+  }
+  document.getElementById('lip-status').textContent = `${maxPhoneme} (${maxVal.toFixed(2)})`;
+}
+
+function applyExpression() {
+  const expr = document.getElementById('expression-select').value;
+  currentExpression = expr;
+  setStatus(expr === 'neutral' ? 'ニュートラル' : expr);
+  document.getElementById('expr-status').textContent = expr;
+}
+
+function resetExpression() {
+  currentExpression = 'neutral';
+  setStatus('ニュートラル');
+  document.getElementById('expr-status').textContent = 'ニュートラル';
+}
+
+function triggerLip(phoneme) {
+  for (const p of Object.keys(lipSyncValues)) lipSyncValues[p] = 0;
+  lipSyncValues[phoneme] = 1.0;
+  document.getElementById('lip-status').textContent = phoneme;
+  setTimeout(() => { lipSyncValues[phoneme] = 0; }, 200);
+}
+
+function applyBodyMotion() {
+  const breath = parseFloat(document.getElementById('breath-slider').value);
+  setStatus(`身振り: breath=${breath}`);
+}
+
+function togglePipeline() {
+  pipelinePaused = !pipelinePaused;
+  const btn = document.getElementById('pipeline-btn');
+  btn.textContent = pipelinePaused ? 'パイプライン開始' : 'パイプライン停止';
+  setStatus(pipelinePaused ? '待機中' : '実行中');
+}
+
+// WebSocket for receiving pipeline data
+function connectWebSocket() {
+  setStatus('待機中');
+  document.getElementById('loading').classList.add('hidden');
+}
+
+// Load blend shape frames
+function loadBlendShapeFrames() {
+  fetch('vrma_frames.json')
+    .then(r => r.json())
+    .then(frames => {
+      frameCount = frames.length;
+      document.getElementById('frame-count').textContent = frameCount;
+    })
+    .catch(() => {});
+}
+
+initScene().then(() => {
+  loadBlendShapeFrames();
+});
+</script>
+</body>
+</html>

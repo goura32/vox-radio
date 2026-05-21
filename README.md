@@ -1,94 +1,60 @@
-# VOX-Radio — Real-time Radio → VRM Avatar Pipeline
+# VOX-Radio 🎙️
 
-https://github.com/goura32/vox-radio
+FMラジオ → 文字起こし → 要約 → VOICEVOX → VRMアバター表示パイプライン
 
-JCBA/FM ラダリオから HeartFM をリアルタイム受信 → 文字起こし → 要約+感情分析 → VOICEVOX 音声合成 → VRM アバターのリップシンク・表情・身振りをブラウザで表示するパイプライン。
+## 概要
 
-## Features
+HeartFMなどのFMラジオ放送をリアルタイムで受信し、AIによる文字起こし・要約・感情分析を行い、VOICEVOXで音声合成、3Dアバター(VRM)で表現するパイプライン
 
-- 🎙️ **HeartFM 受信** - JCBA WebSocket 経由で Ogg/Opus ストリームを受信
-- 🤖 **文字起こし** - faster-whisper large-v3-turbo で高精度文字起こし
-- 🧠 **要約＋感情** - Gemma4(e4b) による要約＋感情分析＋区間検出
-- 🗣️ **音声合成** - VOICEVOX による自然な音声への変換
-- 🎭 **VRM アバター** - リップシンク＋表情＋身振り表現
-- 💻 **ブラウザ表示** - three-vrm で VRM モデルをブラウザ上にリアルタイム表示
+## 機能
 
-## Architecture
+- **ラジオ受信**: JCBA FMラダリオAPI経由でHeartFMをWebSocket受信
+- **文字起こし**: faster-whisper large-v3-turboで高精度音声認識
+- **要約+感情分析**: Ollama (gemma4:e4b)でテキスト要約、感情スコア、キーワード抽出
+- **音声合成**: VOICEVOX ENGINEで要約テキストを読み上げ
+- **VRM視覚化**: リップシンク・表情・身振りを持つ3Dアバター表示
+- **全工程ファイル保存**: raw audio, transcript, summary, synth audio, vrma frames
 
-```
-[HeartFM WS]→[Ogg/Opus]→[faster-whisper]→[transcription.json]
-                                              ↓
-[VRM Browser]←[three-vrm]←[AudioQuery]←[VOICEVOX]←[summary.json]+[emotion.json]
-     ↓                                              ↑
-[fallback_text]  [Gemma4 Summary]←[Ollama:11434]
-```
+## 依存関係
 
-## Quick Start
+- Python 3.10+
+- Ollama (gemma4:e4b)
+- VOICEVOX ENGINE
+- faster-whisper (CUDA対応推奨)
+- ffmpeg
+- three.js + three-vrm (ブラウザ表示)
 
-### 1. Install dependencies
+## セットアップ
 
 ```bash
+cd vox-radio
 uv sync
-```
-
-### 2. Configure
-
-```bash
 cp .env.example .env
-# Edit .env with your settings
+# .env を必要に応じて編集
 ```
 
-### 3. Run
+## 実行
 
 ```bash
-python src/app.py
+# パイプライン実行 (5分ループ)
+python -m src.main
+
+# 単発実行
+python -m src.main --once
+
+# VRMブラウザ表示
+cd vis
+python -m http.server 8080
 ```
 
-## Directory Structure
+## フォーマット
 
-```
-vox-radio/
-├── src/                    # Core application code
-│   ├── radio/             # HeartFM receiver (WebSocket, Ogg/Opus)
-│   ├── transcription/     # faster-whisper wrapper
-│   ├── summarization/     # Gemma4 summary+emotion
-│   ├── tts/               # VOICEVOX AudioQuery client
-│   ├── vr_renderer/       # VRM browser display
-│   ├── output/            # File save utilities
-│   └── app.py             # Main orchestrator
-├── frontend/               # Browser VRM viewer
-│   ├── index.html
-│   ├── main.js
-│   └── package.json
-├── config/                 # Configuration files
-├── tests/                  # Test suite
-├── utils/                  # Utilities
-├── outputs/                # Generated output files
-├── DESIGN_DOC.md           # Detailed design document
-└── PROJECT.md              # Project overview
-```
+- 生音频: `output/raw/batch_{timestamp}.ogg/.wav`
+- 文字起こし: `output/transcripts/trans_{batch_id}.json/.txt`
+- 要約: `output/summaries/summ_{batch_id}.json`
+- 合成音声: `output/wav/synth_{speaker_id}_{id}.wav`
+- VRM frames: `output/viz/vrma_frames.json`
 
-## Tech Stack
+## アーキテクチャ
 
-| Component | Technology |
-|-----------|------------|
-| Stream Receiver | python-websockets, ffmpeg |
-| Transcription | faster-whisper (large-v3-turbo) |
-| Summarization | Ollama API (Gemma4:e4b) |
-| TTS | VOICEVOX Engine API |
-| VRM Display | three.js + three-vrm + WebXR |
-| Language | Python 3.11+, TypeScript |
-
-## Development
-
-```bash
-# Run tests
-pytest tests/
-
-# Type check
-mypy src/
-```
-
-## License
-
-MIT
+DESIGN.md 参照
