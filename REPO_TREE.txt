@@ -1,0 +1,63 @@
+PROJECT.md
+README.md
+DESIGN_DOC.md
+LICENSE
+.dockerignore
+.gitignore
+requirements.txt
+.env.example
+src/
+  __init__.py
+  radio/
+    __init__.py
+    receiver.py
+    ogg_stream.py
+    jwt_manager.py
+  transcription/
+    __init__.py
+    whisper_engine.py
+    segmenter.py
+  summarization/
+    __init__.py
+    gemma4_summary.py
+    emotion_analysis.py
+    prompt_templates.py
+  tts/
+    __init__.py
+    voicevox_client.py
+    audio_query_builder.py
+  vr_renderer/
+    __init__.py
+    vrml_manager.py
+    lip_sync_analyzer.py
+    expression_generator.py
+    body_motion_generator.py
+  output/
+    __init__.py
+    file_writer.py
+    log_writer.py
+  app.py
+frontend/
+  index.html
+  main.js
+  package.json
+  package-lock.json
+  vite.config.js
+utils/
+  vrm_loader.py
+  audio_player.py
+  config.py
+tests/
+  test_receiver.py
+  test_transcription.py
+  test_summarization.py
+  test_tts.py
+  test_vr.py
+  conftest.py
+tests/__init__.py
+config/
+  settings.yaml
+  speakers.yaml
+  vrmodel.yaml
+outputs/
+logs/

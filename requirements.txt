@@ -1,0 +1,29 @@
+# ─── 基盤 ───
+python>=3.11,<3.13
+
+# ─── JCBA/FMラダリオ受信 ───
+websockets>=12
+requests>=2.31
+ffmpeg-python>=0.2
+
+# ─── 文字起こし ───
+faster-whisper>=1.0
+torchaudio>=2.2
+soundfile>=0.12
+
+# ─── 要約・感情分析 ───
+ollama>=0.1
+pydantic>=2.5
+
+# ─── 音声合成 ───
+voicevox-engine>=0.0
+
+# ─── VRM / フロント ───
+numpy>=1.26
+scipy>=1.11
+
+# ─── 開発 ───
+pytest>=7.4
+black>=23.0
+mypy>=1.5
+ruff==
