@@ -1,5 +1,6 @@
-"""Configuration for VOX-Radio pipeline."""
+"""Configuration for VOX-Radio pipeline with auto GPU detection."""
 import os
+import torch
 from pathlib import Path
 
 # ── Paths ──
@@ -21,6 +22,24 @@ def paths():
     }
 
 
+# ── GPU Auto-detection ──
+def _detect_device():
+    """Auto-detect best device: cuda if GPU available and env override not set."""
+    env_device = os.getenv("WHISPER_DEVICE", "").strip()
+    if env_device:
+        return env_device  # respect user override
+    try:
+        has_cuda = torch.cuda.is_available()
+        has_mps = hasattr(torch, "mps") and torch.mps.is_available()
+        if has_cuda:
+            return "cuda"
+        elif has_mps:
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
 # ── Radio Config ───────────────────────────
 JCBA_API_URL = os.getenv("JCBA_API_URL", "https://radimo.smen.biz/api/v1/select_stream")
 HEARTFM_STATION_ID = os.getenv("HEARTFM_STATION_ID", "heartfm")
@@ -37,7 +56,7 @@ RADIO_MINUTES = int(os.getenv("RADIO_MINUTES", "0"))           # 0 = infinite
 
 # ── Whisper Config ───────────────────────
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3-turbo")
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+WHISPER_DEVICE = _detect_device()          # auto: cuda > mps > cpu
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
 WHISPER_LANG = os.getenv("WHISPER_LANG", "ja")
 
@@ -66,7 +85,7 @@ VOICEVOX_INTONATION = float(os.getenv("VOICEVOX_INTONATION", "1.0"))
 
 
 # ── VRM Config ───────────────────────────
-VRM_MODEL_PATH = os.getenv("VRM_MODEL_PATH", str(BASE_DIR / "assets/vrms/hrn0Hk8kxp.glb"))
+VRM_MODEL_PATH = os.getenv("VRM_MODEL_PATH", str(BASE_DIR / "assets/vrms/avatar_sample_b.vrm"))
 
 # Idle animation
 IDLE_BLINK_INTERVAL = float(os.getenv("IDLE_BLINK_INTERVAL", "4.0"))  # seconds between blinks

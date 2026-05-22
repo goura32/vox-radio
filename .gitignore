@@ -8,5 +8,11 @@ venv/
 output/*
 !output/.gitkeep
 .env
+.env.*
 .vscode/
 .DS_Store
+assets/vrms/*.glb
+assets/vrms/*.vrm
+assets/vrms/*.glb.enc
+assets/vrms/*.vrm.enc
+*.orig

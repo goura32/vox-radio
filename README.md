@@ -1,4 +1,4 @@
-# VOX-Radio — FM ラジオ → VRM アバターパイプライン 📻
+# VOX-Radio — FMラジオ → VRMアバターパイプライン 📻
 
 JCBA FMラダリオのインターネット電波をリアルタイム受信 → 文字起こし → 要約＋感情分析 → VOICEVOX音声合成 → VRMアバターのリップシンク・表情・身振り表現 → ブラウザ表示
 
@@ -9,7 +9,7 @@ JCBA FMラダリオのインターネット電波をリアルタイム受信 →
 ```
 ┌─ HeartFM WS ──▶ ── faster-whisper ──▶ ── Gemma4要約 ──▶ ── VOICEVOX ──▶ ── VRMブラウザ ──┐
 │        Ogg/Opus          large-v3-turbo        Gemma4e4b         AudioQuery          three-vrm      │
-└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+├────────ー───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 機能
@@ -24,6 +24,39 @@ JCBA FMラダリオのインターネット電波をリアルタイム受信 →
 | **VRM表示** | Three.js+three-vrmブラウザ3Dビューア（リップ・表情・身振り） |
 | **全工程生成物保存** | raw, WAV, 文字起こしJSON, 要約JSON, TTS WAV, vrma_frames |
 
+## GPU自動検出
+
+`WHISPER_DEVICE` はデフォルトで**自動検出**される：
+
+- **CUDA対応GPUあり** → `cuda`
+- **Apple Silicon (MPS)あり** → `mps`
+- **GPUなし** → `cpu`（低速）
+
+明示的に環境変数で上書きすることも可能：
+```bash
+WHISPER_DEVICE=cuda uv run python -m src.main  # GPU強制
+WHISPER_DEVICE=cpu uv run python -m src.main   # CPU強制
+```
+
+## VRMモデル
+
+VRMファイルはファイルサイズが大きいため、外部からダウンロードしてください。
+
+### 推奨: VRoid Hub公式サンプルモデル
+
+[VRoid Hub](https://hub.vroid.com/) で「AvatarSample」などで検索すると、無料のキャラクターモデルがDL可能。
+
+### VRMモデル設置
+
+1. 好みのVRMモデル（.vrm または .glb）を [VRoid Hub](https://hub.vroid.com/) からDL
+2. `assets/vrms/` に配置
+3. `.env` の `VRM_MODEL_PATH` を更新
+
+```bash
+mkdir -p assets/vrms
+# DLした model.vrm を assets/vrms/model.vrm に配置
+```
+
 ## 前提条件
 
 - **Python 3.11-3.12**
@@ -31,24 +64,19 @@ JCBA FMラダリオのインターネット電波をリアルタイム受信 →
 - **Ollama** — http://localhost:11434 で稼働中、`gemma4:e4b` モデルをpull済み
 - **VOICEVOX ENGINE** — http://localhost:50021 で稼働中
 - **faster-whisper** — CUDA対応torch推奨（CUDA未対応ならcpuでも動くが遅い）
-- VRM GLBファイル — `assets/vrms/` に設置
+- VRM GLB/VRMファイル — `assets/vrms/` に設置（任意）
 
 ## インストール
 
 ```bash
-# 1. フォルダ準備
 cd /path/to/vox-radio
 
-# 2. 仮想環境作成（uv推奨）
+# 1. 仮想環境作成（uv推奨）
 uv sync
 
-# 3. 設定ファイル
+# 2. 設定ファイル
 cp .env.example .env
 # .env の OLLAMA_URL, VOICEVOX_URL を実際のアドレスに書き換え
-
-# 4. VRMモデル設置
-mkdir -p assets/vrms
-# VRM GLBファイル を assets/vrms/ に配置（例: hrn0Hk8kxp.glb）
 ```
 
 ## 使い方
@@ -59,11 +87,11 @@ mkdir -p assets/vrms
 # 無限ループ
 uv run python -m src.main
 
-# 10分だけ実行
-RADIO_MINUTES=10 uv run python -m src.main
+# 5分だけ実行
+RADIO_MINUTES=5 uv run python -m src.main
 
-# 1回だけ
-uv run python -m src.main --once
+# 1回だけ（一度だけ受信→処理→終了）
+RADIO_MINUTES=1 uv run python -m src.main
 ```
 
 ### VRMブラウザビューア
@@ -112,7 +140,7 @@ print(result.summary)
 ## 全工程の生成物ファイル
 
 | 工程 | ファイル形式 | 保存先 |
-|------|-------------|--------|
+|------|----------|------|
 | 生音频 | `.ogg`, `.wav`, `_meta.json` | `output/raw/` |
 | 文字起こし | `.json`（セグメント）, `.txt` | `output/transcripts/` |
 | 要約＋感情 | `.json` | `output/summaries/` |
@@ -121,13 +149,26 @@ print(result.summary)
 | パイプラインログ | `.log` | `logs/` |
 | バッチ記録 | `batch_{id}.json` | `output/` |
 
+## .gitignore方針
+
+| ファイル・ディレクトリ | git管理 | 理由 |
+|---|---|---|
+| .env | ❌ | APIキー/サーバーアドレスなど機密情報 |
+| output/ | ❌ | 実行時の生成オブジェクト |
+| assets/vrms/*.glb | ❌ | ファイルサイズが大きい |
+| assets/vrms/*.vrm | ❌ | ファイルサイズが大きい |
+| .venv/ | ❌ | 依存環境 |
+| uv.lock | ✅ | 再現用 |
+| pyproject.toml | ✅ | 依存定義 |
+| ソースコード | ✅ | |
+
 ## 設定項目
 
 | 環境変数 | 既定 | 説明 |
-|----------|------|------|
+|------|------|------|
 | `HEARTFM_STATION_ID` | `heartfm` | 放送局ID |
 | `WHISPER_MODEL` | `large-v3-turbo` | Whisperモデル |
-| `WHISPER_DEVICE` | `cuda` | 推論デバイス |
+| `WHISPER_DEVICE` | `auto` | 推論デバイス (auto/cuda/cpu) |
 | `WHISPER_COMPUTE_TYPE` | `float16` | 演算精度 |
 | `OLLAMA_MODEL` | `gemma4:e4b` | 要約モデル |
 | `VOICEVOX_SPEAKER_ID` | `1` | デフォルトスピーカー |
@@ -179,45 +220,20 @@ print(result.summary)
 - Expression: emotion → VRM preset
 - Idle: random blink + body sway + breathing
 
-### ビジュアライザー (viz/audio_visualizer.py)
-- WAVファイルからRMSエネルギー、スペクトル分析
-- `viz/index.html` で表示
-
 ## サポート
-
-### トラブルシューティング
-
-- **JCBA FMラダリオのWebSocketが切れる**: JWT期限（15秒）問題。`_refresh_loop` が10秒毎に自動更新。外部から直接APIを叩くとタイムアウトする場合、プロキシ/ファイアウォールの確認
-- **Ollama未接続**: Summarizerが `_fallback` モードに自動切り替え
-- **VOICEVOXエラー**: `/initialize_speaker?speaker={id}` で204が返ることを確認
-- **CUDA unavailable**: `WHISPER_DEVICE=cpu` に設定（推論時間は数十倍）
-- **VRMモデルが見つからない**: `assets/vrms/` が空 → VRM GLBファイルをダウンロードして設置
 
 ### VRMモデルの入手
 
 - **VRoid Hub** — https://hub.vroid.com/
-- **VRMモデルライブラリ** — モデルデータを `.glb` または `.vrm` で入手し、`assets/vrms/` に置く
+- VRM GLB/VRMファイルをDLして`assets/vrms/`に配置
 
-## 依存関係
+### トラブルシューティング
 
-```
-requests          — HTTPクライアント
-websockets        — JCBA FMラダリオWS接続
-ffmpeg-python     — Ogg→WAV変換（ffmpeg必須）
-faster-whisper    — 文字起こし
-ollama            — Gemma4要約
-torch             — Whisper GPU推論
-numpy / scipy     — VRM計算
-```
+- **JCBA FMラダリオのWebSocketが切れる**: JWT期限（15秒）問題。`_refresh_loop` が10秒毎に自動更新
+- **Ollama未接続**: Summarizerが `_fallback` モードに自動切り替え
+- **CUDA unavailable**: `WHISPER_DEVICE=cpu` に設定（推論時間は数十倍）
+- **VRMモデルが見つからない**: `assets/vrms/` が空 → VRM/GLBファイルをダウンロードして設置
 
 ## ライセンス
 
 MIT
-
-## 将来の拡張
-
-- [ ] 他JCBA局のサポート（142局以上）
-- [ ] VRM身振りの高度化（WebXR対応）
-- [ ] 音声可視化のリアルタイム表示
-- [ ] Telegram/LINE連携でストリーム配信
-- [ ] ストレージのアーカイブ化（S3へアップロード）

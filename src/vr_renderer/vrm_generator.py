@@ -82,6 +82,13 @@ class VRMVisualizer:
 
     def __init__(self, model_path: str = VRM_MODEL_PATH):
         self.model_path = model_path
+        self._model_available = Path(model_path).resolve().exists()
+        if not self._model_available:
+            log.warning(
+                "VRM model not found at %s — 3D visualization disabled. "
+                "Download sample: https://hub.vroid.com/en/characters/7939147878897061040/models/2292219474373673889",
+                model_path,
+            )
         self._expr_timer = time.time()
         self._expr_name  = "neutral"
 
